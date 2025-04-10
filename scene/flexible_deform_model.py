@@ -17,41 +17,26 @@ import os
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from random import randint
-from utils.sh_utils import RGB2SH, SH2RGB
+from utils.sh_utils import RGB2SH
 from simple_knn._C import distCUDA2
-from utils.graphics_utils import BasicPointCloud, getWorld2View2
+from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.regulation import compute_plane_smoothness
 from typing import Tuple
 
-import cv2
-import open3d as o3d
-from simple_knn._C import distCUDA2
-
-import scipy
-from scipy.spatial.transform import Rotation as R
-
-#changes made based on errors shown
-
-SAVE_TIME = 10
-INTERVAL = 0.05
-MAX_NUM = int(SAVE_TIME/INTERVAL)
-GAUSSIAN_NUM = 10
 FOURIER_ORDER_NUM = 10
-CH_NUM = 13
+CH_NUM = 11
 CURVE_NUM = 20
-    
+GM_NUM = 8
+
 class GaussianModel:
 
     def setup_functions(self):
-        return
-
-
-    def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
-        L = build_scaling_rotation(scaling_modifier * scaling, rotation)
-        actual_covariance = L @ L.transpose(1, 2)
-        symm = strip_symmetric(actual_covariance)
-        return symm
+        def build_covariance_from_scaling_rotation(scaling, scaling_modifier, rotation):
+            L = build_scaling_rotation(scaling_modifier * scaling, rotation)
+            actual_covariance = L @ L.transpose(1, 2)
+            symm = strip_symmetric(actual_covariance)
+            return symm
         
         self.scaling_activation = torch.exp
         self.scaling_inverse_activation = torch.log
@@ -60,60 +45,31 @@ class GaussianModel:
         self.inverse_opacity_activation = inverse_sigmoid
         self.rotation_activation = torch.nn.functional.normalize
 
-    def __init__(self, sh_degree : int, args, config=None):
+    def __init__(self, sh_degree : int, args):
         self.active_sh_degree = 0
-        self.max_sh_degree = sh_degree
-        # self.max_sh_degree = 0
-
-        self._xyz = torch.empty(0, device="cuda")
-        self._features_dc = torch.empty(0, device="cuda")
-        self._features_rest = torch.empty(0, device="cuda")
-        self._scaling = torch.empty(0, device="cuda")
-        self._rotation = torch.empty(0, device="cuda")
-        self._opacity = torch.empty(0, device="cuda")
-        self._coefs = torch.empty(0, device="cuda")
-        self.max_radii2D = torch.empty(0, device="cuda")
-        self.xyz_gradient_accum = torch.empty(0, device="cuda")
-
-        self.unique_kfIDs = torch.empty(0).int()
-        self.n_obs = torch.empty(0).int()
-
-        self.config = config
-        self.ply_input = None
-        self.args = args
+        self.max_sh_degree = sh_degree  
+        self._xyz = torch.empty(0)
         
-        self.gm_num = 8
+        self.args = args
+
+        self._deformation_table = torch.empty(0)
+        self._features_dc = torch.empty(0)
+        self._features_rest = torch.empty(0)
+        self._scaling = torch.empty(0)
+        self._rotation = torch.empty(0)
+        self._coefs = torch.empty(0)
+        self._opacity = torch.empty(0)
+        self.max_radii2D = torch.empty(0)
+        self.xyz_gradient_accum = torch.empty(0)
+        self.denom = torch.empty(0)
+        self.optimizer = None
+        self.percent_dense = 0
+        self.spatial_lr_scale = 0
+        self.setup_functions()
+
+        self.gm_num = GM_NUM
         self.ch_num = CH_NUM
         self.fs_num = FOURIER_ORDER_NUM
-        
-        self.save_coef_path = None
-
-        self.start_time = None
-        self.init_param = 0.03
-        self.min_sigma2 = 1e-4
-
-        self.optimizer = None
-
-        self.scaling_activation = lambda x: torch.clip(torch.exp(x), max=2)
-        # self.scaling_activation = torch.exp
-        self.scaling_inverse_activation = torch.log
-
-        self.covariance_activation = self.build_covariance_from_scaling_rotation
-
-        self.opacity_activation = torch.sigmoid
-        self.inverse_opacity_activation = inverse_sigmoid
-
-        self.rotation_activation = torch.nn.functional.normalize
-
-        self.isotropic = False
-        
-        self.start_time = None
-        self.time = None
-        self.max_time = 1.
-        self.init_param = 0.01
-        self.clear_deformation()
-        #self.training_setup() 
-        
 
     def capture(self):
         return (
@@ -155,44 +111,29 @@ class GaussianModel:
     @property
     def get_scaling(self):
         return self.scaling_activation(self._scaling)
-        
-    @property
-    def get_gaussian_scaling(self):
-        return self.scaling_activation(self._scaling)
-
+    
     @property
     def get_rotation(self):
         return self.rotation_activation(self._rotation)
-        
-    @property
-    def get_gaussian_rotation(self):
-        return self.rotation_activation(self._rotation)
-
+    
     @property
     def get_xyz(self):
         return self._xyz
-    
+    @property
+    def get_coef(self):
+        return self._coefs, self.args.poly_order_num, self.args.fs_order_num
     @property
     def get_features(self):
         features_dc = self._features_dc
         features_rest = self._features_rest
-        if self.deform_brightness is None:
-            return torch.cat((features_dc, features_rest), dim=1)
-        else:
-            return torch.cat((features_dc+self.deform_brightness, features_rest), dim=1)
-
+        return torch.cat((features_dc, features_rest), dim=1)
+    
     @property
     def get_opacity(self):
         return self.opacity_activation(self._opacity)
-        
-    @property
-    def get_gaussian_opacity(self):
-        return self.opacity_activation(self._opacity)
-
-    def get_covariance(self, scaling_modifier=1):
-        return self.covariance_activation(
-            self.get_gaussian_scaling, scaling_modifier, self._rotation
-        )
+    
+    def get_covariance(self, scaling_modifier = 1):
+        return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
 
     def oneupSHdegree(self):
         if self.active_sh_degree < self.max_sh_degree:
@@ -215,9 +156,9 @@ class GaussianModel:
 
         
         N = fused_point_cloud.shape[0]
-        weight_coefs = torch.zeros((N, CH_NUM, CURVE_NUM))
-        position_coefs = torch.zeros((N, CH_NUM, CURVE_NUM)) + torch.linspace(0,1,CURVE_NUM)
-        shape_coefs = torch.zeros((N, CH_NUM, CURVE_NUM)) + self.args.init_param
+        weight_coefs = torch.zeros((N, self.args.ch_num, self.args.curve_num))
+        position_coefs = torch.zeros((N, self.args.ch_num, self.args.curve_num)) + torch.linspace(0,1,self.args.curve_num)
+        shape_coefs = torch.zeros((N, self.args.ch_num, self.args.curve_num)) + self.args.init_param
         _coefs = torch.stack((weight_coefs, position_coefs, shape_coefs), dim=2).reshape(N,-1).float().to("cuda")
         self._coefs = nn.Parameter(_coefs.requires_grad_(True))
         
@@ -231,9 +172,8 @@ class GaussianModel:
         self._opacity = nn.Parameter(opacities.requires_grad_(True))
         self.max_radii2D = torch.zeros((self.get_xyz.shape[0]), device="cuda")
         self._deformation_table = torch.gt(torch.ones((self.get_xyz.shape[0]),device="cuda"),0)
-
+    
     def training_setup(self, training_args):
-        #training_args = self.config['opt_params']
         self.percent_dense = training_args.percent_dense
         self.xyz_gradient_accum = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
         self.denom = torch.zeros((self.get_xyz.shape[0], 1), device="cuda")
@@ -259,7 +199,6 @@ class GaussianModel:
                                                     lr_final=training_args.deformation_lr_final*self.spatial_lr_scale,
                                                     lr_delay_mult=training_args.deformation_lr_delay_mult,
                                                     max_steps=training_args.position_lr_max_steps) 
-
 
 
     def update_learning_rate(self, iteration):
@@ -292,6 +231,7 @@ class GaussianModel:
         for i in range(self._coefs.shape[1]):
             l.append('coefs_{}'.format(i))
         return l
+
 
     def load_model(self, path):
         print("loading model from exists{}".format(path))
@@ -375,7 +315,7 @@ class GaussianModel:
         elements[:] = list(map(tuple, attributes))
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
-
+        
     def reset_opacity(self):
         opacities_new = inverse_sigmoid(torch.min(self.get_opacity, torch.ones_like(self.get_opacity)*0.01))
         optimizable_tensors = self.replace_tensor_to_optimizer(opacities_new, "opacity")
@@ -506,6 +446,7 @@ class GaussianModel:
         prune_filter = torch.cat((selected_pts_mask, torch.zeros(N * selected_pts_mask.sum(), device="cuda", dtype=bool)))
         self.prune_points(prune_filter)
 
+
     def densify_and_clone(self, grads, grad_threshold, scene_extent):
         # Extract points that satisfy the gradient condition
         selected_pts_mask = torch.where(torch.norm(grads, dim=-1) >= grad_threshold, True, False)
@@ -541,6 +482,7 @@ class GaussianModel:
         self.densify_and_split(grads, max_grad, extent)
     
     def standard_constaint(self):
+        
         means3D = self._xyz.detach()
         scales = self._scaling.detach()
         rotations = self._rotation.detach()
@@ -551,7 +493,6 @@ class GaussianModel:
         rotation_error = (rotations_deform - rotations)**2 
         scaling_erorr = (scales_deform - scales)**2
         return position_error.mean() + rotation_error.mean() + scaling_erorr.mean()
-
 
     def add_densification_stats(self, viewspace_point_tensor, update_filter):
         self.xyz_gradient_accum[update_filter] += torch.norm(viewspace_point_tensor[update_filter,:2], dim=-1, keepdim=True)
@@ -584,7 +525,7 @@ class GaussianModel:
             gaussian =  torch.exp(-exponent**2)         
             deform += (gaussian*weight).sum(-1).squeeze()
         return deform
-
+    
     def deformation(self, xyz: torch.Tensor, scales: torch.Tensor, rotations: torch.Tensor, time: float):
         deform = self.partial_gaussian_deformation(time)
         deform_xyz = deform[:,:3]
@@ -597,8 +538,7 @@ class GaussianModel:
         rotations += deform_rot
         scales += deform_scaling
         return xyz, scales, rotations
-
-
+        
     def print_deformation_weight_grad(self):
         for name, weight in self._deformation.named_parameters():
             if weight.requires_grad:
@@ -612,15 +552,17 @@ class GaussianModel:
     
     def compute_sparsity_regulation(self,):
         N = len(self._xyz)
-        ch_num = CH_NUM
+        ch_num = self.args.ch_num
         coefs = self._coefs.reshape(N, ch_num, -1).contiguous() # [N, 7, ORDER_NUM + ORDER_NUM * 2 ]
         return (torch.sum(torch.abs(coefs), dim=-1, keepdim=True)\
             /torch.abs(coefs.max(dim=-1, keepdim = True)[0])).mean()   
         
     def compute_l1_regulation(self,):
+
         return (torch.abs(self._coefs)).mean()
     
     def compute_l2_regulation(self,):
+
         return (self._coefs**2).mean()
     
     def _plane_regulation(self):
@@ -648,7 +590,7 @@ class GaussianModel:
             for grid_id in time_grids:
                 total += compute_plane_smoothness(grids[grid_id])
         return total
-
+    
     def _l1_regulation(self):
                 # model.grids is 6 x [1, rank * F_dim, reso, reso]
         multi_res_grids = self._deformation.deformation_net.grid.grids
@@ -666,11 +608,3 @@ class GaussianModel:
 
     def compute_regulation(self, time_smoothness_weight, l1_time_planes_weight, plane_tv_weight):
         return plane_tv_weight * self._plane_regulation() + time_smoothness_weight * self._time_regulation() + l1_time_planes_weight * self._l1_regulation()
-
-    def clear_deformation(self):
-        self.deform = None
-        self.deform_xyz = None
-        self.deform_rot = None
-        self.deform_scaling = None
-        self.deform_opacity = None 
-        self.deform_brightness = None
