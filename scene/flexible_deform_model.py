@@ -24,7 +24,6 @@ from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.regulation import compute_plane_smoothness
 from typing import Tuple
 
-FOURIER_ORDER_NUM = 10
 CH_NUM = 11
 CURVE_NUM = 20
 GM_NUM = 8
@@ -69,7 +68,6 @@ class GaussianModel:
 
         self.gm_num = GM_NUM
         self.ch_num = CH_NUM
-        self.fs_num = FOURIER_ORDER_NUM
 
     def capture(self):
         return (
