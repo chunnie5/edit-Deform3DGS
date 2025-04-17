@@ -513,7 +513,6 @@ class GaussianModel:
         N = len(self._xyz)
         coefs = self._coefs.reshape(N, CH_NUM, 3 , CURVE_NUM).contiguous() 
         coefs = torch.split(coefs, [min_idx, max_idx-min_idx, CURVE_NUM-max_idx], -1)
-        # coefs = torch.split(coefs, [min_idx, max_idx-min_idx, CURVE_NUM-max_idx], -1)
         deform = 0
         for i, coef in enumerate(coefs):
             if i != 1:
@@ -530,7 +529,6 @@ class GaussianModel:
         deform_rot = deform[:, 3:7]
         deform_scaling = deform[:, 7:10]
         if CH_NUM>=11:
-            # self.deform_opacity = deform[:, 10:]
             deform_brightness = deform[:, None, 10:]
         xyz += deform_xyz
         rotations += deform_rot
